@@ -1,6 +1,6 @@
-streamlit
-pandas
-numpy
-scikit-learn
-folium
-streamlit-folium
+streamlit==1.38.0
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.5.1
+folium==0.17.0
+streamlit-folium==0.22.0
