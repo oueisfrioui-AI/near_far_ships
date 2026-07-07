@@ -204,7 +204,7 @@ def build_map(ports_df, stops_far_df, stops_near_df):
         ).add_to(far_cluster)
     far_layer.add_to(m)
 
-    folium.LayerControl(collapsed=False).add_to(m)
+    folium.LayerControl(position="topright", collapsed=True).add_to(m)
     return m
 
 
