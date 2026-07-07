@@ -15,7 +15,7 @@ import pandas as pd
 import streamlit as st
 import folium
 from folium.plugins import MarkerCluster
-from streamlit_folium import st_folium
+from streamlit_folium import folium_static
 from sklearn.neighbors import BallTree
 
 st.set_page_config(page_title="AIS Stationary Ship Detector", layout="wide")
@@ -325,7 +325,7 @@ if ais_file is not None:
 
         st.subheader("🗺️ Interactive map")
         m = build_map(ports, stops_far_from_port, stops_at_port)
-        st_folium(m, width=1200, height=600)
+        folium_static(m, width=1200, height=600)
 
         col_dl1, col_dl2 = st.columns(2)
         col_dl1.download_button(
