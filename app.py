@@ -142,11 +142,12 @@ def flag_port_stops(episodes_df, ports_df, port_dist_threshold_m):
     return episodes_df
 
 
+@st.cache_resource(show_spinner=False)
 def build_map(ports_df, stops_far_df, stops_near_df):
     if len(stops_far_df) or len(stops_near_df):
         all_lats = pd.concat(
             [stops_far_df["start_lat"], stops_near_df["start_lat"]], ignore_index=True
-        ) if len(stops_far_df) or len(stops_near_df) else ports_df["port_lat"]
+        )
         center_lat = all_lats.mean()
         all_lons = pd.concat(
             [stops_far_df["start_lon"], stops_near_df["start_lon"]], ignore_index=True
@@ -209,6 +210,29 @@ def build_map(ports_df, stops_far_df, stops_near_df):
 
 
 # ============================================================
+# Session state initialization
+# ============================================================
+# We store the computed analysis results here so that reruns triggered by
+# things OTHER than the "Run analysis" button (e.g. panning/zooming/clicking
+# the st_folium map, which is a bidirectional component and reruns the whole
+# script) don't wipe out what's on screen. st.button() only returns True on
+# the single run where the click happened, so gating the results display on
+# it directly is what was causing the "reset" behaviour.
+if "result" not in st.session_state:
+    st.session_state.result = None          # full episodes dataframe (no port match)
+if "stops_at_port" not in st.session_state:
+    st.session_state.stops_at_port = None
+if "stops_far_from_port" not in st.session_state:
+    st.session_state.stops_far_from_port = None
+if "ports" not in st.session_state:
+    st.session_state.ports = None
+if "n_rows" not in st.session_state:
+    st.session_state.n_rows = None
+if "n_vessels" not in st.session_state:
+    st.session_state.n_vessels = None
+
+
+# ============================================================
 # Sidebar - inputs
 # ============================================================
 st.title("🚢 AIS Stationary Ship Detector")
@@ -245,55 +269,93 @@ if ais_file is not None:
 
     run = st.sidebar.button("Run analysis", type="primary")
 
+    # --- Only (re)compute when the button is actually clicked. -------------
+    # Everything computed here is written into st.session_state so it
+    # survives later reruns that aren't caused by this button (map clicks,
+    # tab switches, download-button clicks, etc.)
     if run:
         with st.spinner("Loading AIS data..."):
             df = load_ais_csv(ais_bytes, id_col, time_col, lat_col, lon_col, time_format)
-        st.success(f"Loaded {len(df):,} rows across {df['vessel_id'].nunique():,} vessels.")
+        st.session_state.n_rows = len(df)
+        st.session_state.n_vessels = df["vessel_id"].nunique()
 
         with st.spinner("Detecting stationary episodes..."):
             episodes = detect_stationary_episodes(df, dist_threshold_m, min_gap_hours)
         result = episodes[episodes["total_duration"] >= pd.Timedelta(hours=min_gap_hours)].reset_index(drop=True)
-        st.success(f"Found {len(result):,} stationary episodes of at least {min_gap_hours}h.")
 
         if ports_file is not None and len(result) > 0:
             ports_bytes = ports_file.getvalue()
             with st.spinner("Loading port reference data..."):
                 ports = load_ports(ports_bytes)
-
             with st.spinner("Matching stops to nearest ports..."):
                 result = flag_port_stops(result, ports, port_dist_threshold_m)
 
-            stops_at_port = result[result["at_port"]].reset_index(drop=True)
-            stops_far_from_port = result[~result["at_port"]].reset_index(drop=True)
+            st.session_state.ports = ports
+            st.session_state.stops_at_port = result[result["at_port"]].reset_index(drop=True)
+            st.session_state.stops_far_from_port = result[~result["at_port"]].reset_index(drop=True)
+            st.session_state.result = None
+        else:
+            st.session_state.result = result
+            st.session_state.ports = None
+            st.session_state.stops_at_port = None
+            st.session_state.stops_far_from_port = None
 
-            col1, col2 = st.columns(2)
-            col1.metric("Stops near a port", len(stops_at_port))
-            col2.metric("Stops far from any port", len(stops_far_from_port))
+    # --- Render from session_state (independent of the button value). ------
+    if st.session_state.n_rows is not None:
+        st.success(
+            f"Loaded {st.session_state.n_rows:,} rows across "
+            f"{st.session_state.n_vessels:,} vessels."
+        )
 
-            st.subheader("🗺️ Interactive map")
-            m = build_map(ports, stops_far_from_port, stops_at_port)
-            st_folium(m, width=1200, height=600)
+    has_port_results = st.session_state.stops_at_port is not None
+    has_plain_result = st.session_state.result is not None
 
-            tab1, tab2 = st.tabs(["Stops near port", "Stops far from port"])
-            with tab1:
-                st.dataframe(stops_at_port)
-                st.download_button(
-                    "Download CSV",
-                    stops_at_port.to_csv(index=False).encode("utf-8"),
-                    "stops_at_port.csv",
-                    "text/csv",
-                )
-            with tab2:
-                st.dataframe(stops_far_from_port)
-                st.download_button(
-                    "Download CSV",
-                    stops_far_from_port.to_csv(index=False).encode("utf-8"),
-                    "stops_far_from_port.csv",
-                    "text/csv",
-                )
-        elif len(result) == 0:
+    if has_port_results:
+        stops_at_port = st.session_state.stops_at_port
+        stops_far_from_port = st.session_state.stops_far_from_port
+        ports = st.session_state.ports
+
+        st.success(
+            f"Found {len(stops_at_port) + len(stops_far_from_port):,} stationary "
+            f"episodes of at least {min_gap_hours}h."
+        )
+
+        col1, col2 = st.columns(2)
+        col1.metric("Stops near a port", len(stops_at_port))
+        col2.metric("Stops far from any port", len(stops_far_from_port))
+
+        st.subheader("🗺️ Interactive map")
+        m = build_map(ports, stops_far_from_port, stops_at_port)
+        # A stable key stops st_folium from forcing an unrelated full rerun
+        # cycle to fight with the one caused by its own interactions.
+        st_folium(m, width=1200, height=600, key="ais_map", returned_objects=[])
+
+        tab1, tab2 = st.tabs(["Stops near port", "Stops far from port"])
+        with tab1:
+            st.dataframe(stops_at_port)
+            st.download_button(
+                "Download CSV",
+                stops_at_port.to_csv(index=False).encode("utf-8"),
+                "stops_at_port.csv",
+                "text/csv",
+                key="dl_at_port",
+            )
+        with tab2:
+            st.dataframe(stops_far_from_port)
+            st.download_button(
+                "Download CSV",
+                stops_far_from_port.to_csv(index=False).encode("utf-8"),
+                "stops_far_from_port.csv",
+                "text/csv",
+                key="dl_far_port",
+            )
+
+    elif has_plain_result:
+        result = st.session_state.result
+        if len(result) == 0:
             st.warning("No stationary episodes found with the current parameters. Try loosening the thresholds.")
         else:
+            st.success(f"Found {len(result):,} stationary episodes of at least {min_gap_hours}h.")
             st.info("Upload a port reference CSV in the sidebar to classify stops as near/far from port.")
             st.dataframe(result)
             st.download_button(
@@ -301,6 +363,10 @@ if ais_file is not None:
                 result.to_csv(index=False).encode("utf-8"),
                 "stationary_episodes.csv",
                 "text/csv",
+                key="dl_plain",
             )
+    elif not run:
+        st.info("Set your parameters and click **Run analysis** in the sidebar.")
+
 else:
     st.info("Upload an AIS CSV file in the sidebar to get started.")
