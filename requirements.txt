@@ -1,6 +1,6 @@
-streamlit>=1.38
-streamlit-folium>=0.22
-folium>=0.17
+streamlit
 pandas
 numpy
 scikit-learn
+folium
+streamlit-folium
