@@ -26,6 +26,28 @@ EARTH_RADIUS_M = 6371000.0
 # ============================================================
 # Helper functions
 # ============================================================
+def guess_column(columns, candidates):
+    """Case-insensitive match of column names against a list of likely candidates.
+    Returns the index of the best match in `columns`, or 0 if nothing matches."""
+    lower_map = {c.lower().strip(): c for c in columns}
+    for candidate in candidates:
+        if candidate in lower_map:
+            return columns.index(lower_map[candidate])
+    # fall back to substring match (e.g. "vessel_mmsi", "ship_id_no")
+    for i, col in enumerate(columns):
+        col_l = col.lower().strip()
+        if any(candidate in col_l for candidate in candidates):
+            return i
+    return 0
+
+
+# Common column-name variants seen across different AIS data providers
+ID_CANDIDATES = ["vessel_id", "mmsi", "imo", "ship_id", "vesselid", "shipid", "vessel_name", "mmsi_no"]
+TIME_CANDIDATES = ["timestamp", "time", "datetime", "basedatetime", "base_date_time", "t", "date_time"]
+LAT_CANDIDATES = ["lat", "latitude"]
+LON_CANDIDATES = ["lon", "lng", "long", "longitude"]
+
+
 def haversine_m(lat1, lon1, lat2, lon2):
     lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
     dlat = lat2 - lat1
@@ -252,10 +274,23 @@ if ais_file is not None:
     preview_cols = pd.read_csv(io.BytesIO(ais_bytes), nrows=5).columns.tolist()
 
     st.sidebar.header("3. Map your columns")
-    id_col = st.sidebar.selectbox("Vessel ID column", preview_cols)
-    time_col = st.sidebar.selectbox("Timestamp column", preview_cols)
-    lat_col = st.sidebar.selectbox("Latitude column", preview_cols)
-    lon_col = st.sidebar.selectbox("Longitude column", preview_cols)
+    id_col = st.sidebar.selectbox(
+        "Vessel ID column", preview_cols,
+        index=guess_column(preview_cols, ID_CANDIDATES),
+        help="Auto-detects common names like vessel_id, MMSI, IMO, ship_id.",
+    )
+    time_col = st.sidebar.selectbox(
+        "Timestamp column", preview_cols,
+        index=guess_column(preview_cols, TIME_CANDIDATES),
+    )
+    lat_col = st.sidebar.selectbox(
+        "Latitude column", preview_cols,
+        index=guess_column(preview_cols, LAT_CANDIDATES),
+    )
+    lon_col = st.sidebar.selectbox(
+        "Longitude column", preview_cols,
+        index=guess_column(preview_cols, LON_CANDIDATES),
+    )
 
     time_format = st.sidebar.selectbox(
         "Timestamp format", ["Auto-detect (date string)", "Epoch milliseconds", "Epoch seconds"]
