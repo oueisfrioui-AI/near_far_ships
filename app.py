@@ -41,7 +41,7 @@ def load_ais_csv(file_bytes, id_col, time_col, lat_col, lon_col, time_format):
     df = pd.read_csv(
         io.BytesIO(file_bytes),
         usecols=usecols,
-        dtype={id_col: "string", lat_col: "float32", lon_col: "float32"},
+        dtype={id_col: str, lat_col: "float32", lon_col: "float32"},
     )
     df.columns = df.columns.str.strip()
 
@@ -87,7 +87,7 @@ def detect_stationary_episodes(df, dist_threshold_m, min_gap_hours):
 
     sg = stationary_gaps.sort_values(["vessel_id", "prev_time"]).reset_index(drop=True)
     new_episode = sg["vessel_id"].ne(sg["vessel_id"].shift()) | (sg["prev_time"] > sg["t"].shift())
-    sg["episode_id"] = new_episode.astype("int64").cumsum()   # <-- fix: cast before cumsum
+    sg["episode_id"] = new_episode.cumsum()
 
     episodes = (
         sg.groupby(["episode_id", "vessel_id"])
