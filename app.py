@@ -204,7 +204,7 @@ def build_map(ports_df, stops_far_df, stops_near_df):
         ).add_to(far_cluster)
     far_layer.add_to(m)
 
-    folium.LayerControl(position="topright", collapsed=True).add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
     return m
 
 
@@ -325,9 +325,7 @@ if ais_file is not None:
 
         st.subheader("🗺️ Interactive map")
         m = build_map(ports, stops_far_from_port, stops_at_port)
-        # A stable key stops st_folium from forcing an unrelated full rerun
-        # cycle to fight with the one caused by its own interactions.
-        st_folium(m, width=1200, height=600, key="ais_map", returned_objects=[])
+        st_folium(m, width=1200, height=600)
 
         tab1, tab2 = st.tabs(["Stops near port", "Stops far from port"])
         with tab1:
