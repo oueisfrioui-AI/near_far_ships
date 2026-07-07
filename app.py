@@ -87,7 +87,7 @@ def detect_stationary_episodes(df, dist_threshold_m, min_gap_hours):
 
     sg = stationary_gaps.sort_values(["vessel_id", "prev_time"]).reset_index(drop=True)
     new_episode = sg["vessel_id"].ne(sg["vessel_id"].shift()) | (sg["prev_time"] > sg["t"].shift())
-    sg["episode_id"] = new_episode.cumsum()
+    sg["episode_id"] = new_episode.astype("int64").cumsum()   # <-- fix: cast before cumsum
 
     episodes = (
         sg.groupby(["episode_id", "vessel_id"])
