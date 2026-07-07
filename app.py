@@ -327,25 +327,21 @@ if ais_file is not None:
         m = build_map(ports, stops_far_from_port, stops_at_port)
         st_folium(m, width=1200, height=600)
 
-        tab1, tab2 = st.tabs(["Stops near port", "Stops far from port"])
-        with tab1:
-            st.dataframe(stops_at_port)
-            st.download_button(
-                "Download CSV",
-                stops_at_port.to_csv(index=False).encode("utf-8"),
-                "stops_at_port.csv",
-                "text/csv",
-                key="dl_at_port",
-            )
-        with tab2:
-            st.dataframe(stops_far_from_port)
-            st.download_button(
-                "Download CSV",
-                stops_far_from_port.to_csv(index=False).encode("utf-8"),
-                "stops_far_from_port.csv",
-                "text/csv",
-                key="dl_far_port",
-            )
+        col_dl1, col_dl2 = st.columns(2)
+        col_dl1.download_button(
+            "Download stops near port (CSV)",
+            stops_at_port.to_csv(index=False).encode("utf-8"),
+            "stops_at_port.csv",
+            "text/csv",
+            key="dl_at_port",
+        )
+        col_dl2.download_button(
+            "Download stops far from port (CSV)",
+            stops_far_from_port.to_csv(index=False).encode("utf-8"),
+            "stops_far_from_port.csv",
+            "text/csv",
+            key="dl_far_port",
+        )
 
     elif has_plain_result:
         result = st.session_state.result
