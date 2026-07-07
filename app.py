@@ -142,7 +142,6 @@ def flag_port_stops(episodes_df, ports_df, port_dist_threshold_m):
     return episodes_df
 
 
-@st.cache_resource(show_spinner=False)
 def build_map(ports_df, stops_far_df, stops_near_df):
     if len(stops_far_df) or len(stops_near_df):
         all_lats = pd.concat(
