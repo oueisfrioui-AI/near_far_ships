@@ -260,12 +260,14 @@ def build_map(ports_df, stops_far_df, stops_near_df, fit_to_data=False):
     near_cluster = MarkerCluster().add_to(near_layer)
     for _, row in stops_near_df.iterrows():
         popup_html = (
+            "<div style='word-wrap: break-word; overflow-wrap: break-word; white-space: normal; max-width: 260px;'>"
             f"<b>Vessel:</b> {row['vessel_id']}<br>"
             f"<b>Start:</b> {row['episode_start']}<br>"
             f"<b>End:</b> {row['episode_end']}<br>"
             f"<b>Duration:</b> {row['total_duration']}<br>"
             f"<b>Moved while stationary:</b> {row['net_displacement_m']:.0f} m<br>"
             f"<b>Nearest port:</b> {row['nearest_port']} ({row['dist_to_port_m']:.0f} m)"
+            "</div>"
         )
         folium.Marker(
             location=[row["start_lat"], row["start_lon"]],
@@ -284,12 +286,14 @@ def build_map(ports_df, stops_far_df, stops_near_df, fit_to_data=False):
     far_cluster = MarkerCluster().add_to(far_layer)
     for _, row in stops_far_df.iterrows():
         popup_html = (
+            "<div style='word-wrap: break-word; overflow-wrap: break-word; white-space: normal; max-width: 260px;'>"
             f"<b>Vessel:</b> {row['vessel_id']}<br>"
             f"<b>Start:</b> {row['episode_start']}<br>"
             f"<b>End:</b> {row['episode_end']}<br>"
             f"<b>Duration:</b> {row['total_duration']}<br>"
             f"<b>Moved while stationary:</b> {row['net_displacement_m']:.0f} m<br>"
             f"<b>Nearest port:</b> {row['nearest_port']} ({row['dist_to_port_m']:.0f} m away)"
+            "</div>"
         )
         folium.Marker(
             location=[row["start_lat"], row["start_lon"]],
