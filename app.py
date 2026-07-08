@@ -384,7 +384,7 @@ if ais_file is not None:
         m = build_map(ports, stops_far_from_port, stops_at_port)
         folium_static(m, width=1200, height=600)
 
-        col_dl1, col_dl2 = st.columns(2)
+        col_dl1, col_dl_spacer, col_dl2 = st.columns([2, 3, 2])
         col_dl1.download_button(
             "Download stops near port (CSV)",
             stops_at_port.to_csv(index=False).encode("utf-8"),
