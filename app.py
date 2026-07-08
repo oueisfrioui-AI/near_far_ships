@@ -66,6 +66,16 @@ LAT_CANDIDATES = ["lat", "latitude"]
 LON_CANDIDATES = ["lon", "lng", "long", "longitude"]
 
 
+def fmt_duration(td):
+    """Format a Timedelta as a short human-readable string."""
+    if pd.isna(td):
+        return "-"
+    hours = td.total_seconds() / 3600
+    if hours >= 24:
+        return f"{hours / 24:.1f} days"
+    return f"{hours:.1f} h"
+
+
 def duration_marker_color(total_duration, base):
     """Pick a shade of the base color (green/red) based on how long the stop
     lasted: light = short, normal = medium, dark = long."""
@@ -493,6 +503,19 @@ if ais_file is not None:
         col1, col2 = st.columns(2)
         col1.metric("Stops near a port", len(stops_at_port))
         col2.metric("Stops far from any port", len(stops_far_from_port))
+
+        all_stops = pd.concat([stops_at_port, stops_far_from_port], ignore_index=True)
+        st.subheader("📊 Summary")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Unique vessels", f"{all_stops['vessel_id'].nunique():,}")
+        s2.metric("Avg stop duration", fmt_duration(all_stops["total_duration"].mean()))
+        longest_row = all_stops.loc[all_stops["total_duration"].idxmax()]
+        s3.metric("Longest stop", fmt_duration(longest_row["total_duration"]))
+        s4.metric("Avg drift while stopped", f"{all_stops['net_displacement_m'].mean():.0f} m")
+        st.caption(
+            f"Longest stop: vessel **{longest_row['vessel_id']}**, "
+            f"{longest_row['episode_start']} → {longest_row['episode_end']}."
+        )
 
         st.subheader("🗺️ Interactive map")
 
