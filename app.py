@@ -378,6 +378,8 @@ if "n_rows" not in st.session_state:
     st.session_state.n_rows = None
 if "n_vessels" not in st.session_state:
     st.session_state.n_vessels = None
+if "map_cache" not in st.session_state:
+    st.session_state.map_cache = {}
 
 
 # ============================================================
@@ -450,6 +452,7 @@ if ais_file is not None:
     # survives later reruns that aren't caused by this button (map clicks,
     # tab switches, download-button clicks, etc.)
     if run:
+        st.session_state.map_cache = {}
         with st.spinner("Loading AIS data..."):
             df = load_ais_csv(ais_bytes, id_col, time_col, lat_col, lon_col, time_format)
 
@@ -540,11 +543,14 @@ if ais_file is not None:
 
         map_col, legend_col = st.columns([5, 1])
         with map_col:
-            m = build_map(
-                ports, map_far, map_near,
-                fit_to_data=(vessel_choice != "All vessels"),
-                tile_style=map_style.lower(),
-            )
+            cache_key = (vessel_choice, map_style)
+            if cache_key not in st.session_state.map_cache:
+                st.session_state.map_cache[cache_key] = build_map(
+                    ports, map_far, map_near,
+                    fit_to_data=(vessel_choice != "All vessels"),
+                    tile_style=map_style.lower(),
+                )
+            m = st.session_state.map_cache[cache_key]
             folium_static(m, width=1000, height=600)
         with legend_col:
             st.markdown(LEGEND_HTML, unsafe_allow_html=True)
