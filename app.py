@@ -230,7 +230,7 @@ def flag_port_stops(episodes_df, ports_df, port_dist_threshold_m):
     return episodes_df
 
 
-def build_map(ports_df, stops_far_df, stops_near_df):
+def build_map(ports_df, stops_far_df, stops_near_df, fit_to_data=False):
     if len(stops_far_df) or len(stops_near_df):
         all_lats = pd.concat(
             [stops_far_df["start_lat"], stops_near_df["start_lat"]], ignore_index=True
@@ -303,6 +303,17 @@ def build_map(ports_df, stops_far_df, stops_near_df):
                 locations=track, color="gray", weight=2, opacity=0.6, dash_array="5,5"
             ).add_to(far_layer)
     far_layer.add_to(m)
+
+    if fit_to_data:
+        bounds = []
+        for df_ in (stops_near_df, stops_far_df):
+            for _, row in df_.iterrows():
+                bounds.append([row["start_lat"], row["start_lon"]])
+                track = row.get("approach_track")
+                if track:
+                    bounds.extend([[lat, lon] for lat, lon in track])
+        if bounds:
+            m.fit_bounds(bounds, padding=(30, 30))
 
     folium.LayerControl(collapsed=False).add_to(m)
     return m
@@ -492,7 +503,7 @@ if ais_file is not None:
 
         map_col, legend_col = st.columns([5, 1])
         with map_col:
-            m = build_map(ports, map_far, map_near)
+            m = build_map(ports, map_far, map_near, fit_to_data=(vessel_choice != "All vessels"))
             folium_static(m, width=1000, height=600)
         with legend_col:
             st.markdown(LEGEND_HTML, unsafe_allow_html=True)
