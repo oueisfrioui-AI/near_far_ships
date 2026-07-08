@@ -198,6 +198,7 @@ def build_map(ports_df, stops_far_df, stops_near_df):
             f"<b>Start:</b> {row['episode_start']}<br>"
             f"<b>End:</b> {row['episode_end']}<br>"
             f"<b>Duration:</b> {row['total_duration']}<br>"
+            f"<b>Moved while stationary:</b> {row['net_displacement_m']:.0f} m<br>"
             f"<b>Nearest port:</b> {row['nearest_port']} ({row['dist_to_port_m']:.0f} m)"
         )
         folium.Marker(
@@ -216,6 +217,7 @@ def build_map(ports_df, stops_far_df, stops_near_df):
             f"<b>Start:</b> {row['episode_start']}<br>"
             f"<b>End:</b> {row['episode_end']}<br>"
             f"<b>Duration:</b> {row['total_duration']}<br>"
+            f"<b>Moved while stationary:</b> {row['net_displacement_m']:.0f} m<br>"
             f"<b>Nearest port:</b> {row['nearest_port']} ({row['dist_to_port_m']:.0f} m away)"
         )
         folium.Marker(
