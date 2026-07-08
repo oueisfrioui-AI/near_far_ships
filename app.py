@@ -384,20 +384,26 @@ if ais_file is not None:
         m = build_map(ports, stops_far_from_port, stops_at_port)
         folium_static(m, width=1200, height=600)
 
+        st.markdown(
+            "<style>div[data-testid='stDownloadButton'] button {white-space: nowrap;}</style>",
+            unsafe_allow_html=True,
+        )
         col_dl1, col_dl_spacer, col_dl2 = st.columns([2, 3, 2])
         col_dl1.download_button(
-            "Download stops near port (CSV)",
+            "Near port (CSV)",
             stops_at_port.to_csv(index=False).encode("utf-8"),
             "stops_at_port.csv",
             "text/csv",
             key="dl_at_port",
+            use_container_width=True,
         )
         col_dl2.download_button(
-            "Download stops far from port (CSV)",
+            "Far from port (CSV)",
             stops_far_from_port.to_csv(index=False).encode("utf-8"),
             "stops_far_from_port.csv",
             "text/csv",
             key="dl_far_port",
+            use_container_width=True,
         )
 
     elif has_plain_result:
