@@ -66,6 +66,38 @@ LAT_CANDIDATES = ["lat", "latitude"]
 LON_CANDIDATES = ["lon", "lng", "long", "longitude"]
 
 
+def duration_marker_color(total_duration, base):
+    """Pick a shade of the base color (green/red) based on how long the stop
+    lasted: light = short, normal = medium, dark = long."""
+    hours = total_duration.total_seconds() / 3600
+    if hours < 6:
+        return f"light{base}"
+    elif hours < 24:
+        return base
+    else:
+        return f"dark{base}"
+
+
+@st.cache_data(show_spinner=False)
+def compute_approach_tracks(df, stops_df, lookback_points=5):
+    """For each stop, grab the vessel's last few pings before the stop began,
+    so we can draw a faint line showing how it approached the stop location."""
+    stops_df = stops_df.copy()
+    grouped = {vid: g for vid, g in df.groupby("vessel_id", sort=False)}
+    tracks = []
+    for _, row in stops_df.iterrows():
+        g = grouped.get(row["vessel_id"])
+        if g is None:
+            tracks.append([])
+            continue
+        prior = g[g["t"] < row["episode_start"]].tail(lookback_points)
+        coords = list(zip(prior["lat"].tolist(), prior["lon"].tolist()))
+        coords.append((row["start_lat"], row["start_lon"]))
+        tracks.append(coords)
+    stops_df["approach_track"] = tracks
+    return stops_df
+
+
 def haversine_m(lat1, lon1, lat2, lon2):
     lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
     dlat = lat2 - lat1
@@ -223,8 +255,13 @@ def build_map(ports_df, stops_far_df, stops_near_df):
             location=[row["start_lat"], row["start_lon"]],
             popup=folium.Popup(popup_html, max_width=300),
             tooltip=f"Vessel {row['vessel_id']}",
-            icon=folium.Icon(color="green", icon="ship", prefix="fa"),
+            icon=folium.Icon(color=duration_marker_color(row["total_duration"], "green"), icon="ship", prefix="fa"),
         ).add_to(near_cluster)
+        track = row.get("approach_track")
+        if track and len(track) >= 2:
+            folium.PolyLine(
+                locations=track, color="gray", weight=2, opacity=0.6, dash_array="5,5"
+            ).add_to(near_layer)
     near_layer.add_to(m)
 
     far_layer = folium.FeatureGroup(name="Stops far from port", show=True)
@@ -242,9 +279,31 @@ def build_map(ports_df, stops_far_df, stops_near_df):
             location=[row["start_lat"], row["start_lon"]],
             popup=folium.Popup(popup_html, max_width=300),
             tooltip=f"Vessel {row['vessel_id']}",
-            icon=folium.Icon(color="red", icon="ship", prefix="fa"),
+            icon=folium.Icon(color=duration_marker_color(row["total_duration"], "red"), icon="ship", prefix="fa"),
         ).add_to(far_cluster)
+        track = row.get("approach_track")
+        if track and len(track) >= 2:
+            folium.PolyLine(
+                locations=track, color="gray", weight=2, opacity=0.6, dash_array="5,5"
+            ).add_to(far_layer)
     far_layer.add_to(m)
+
+    legend_html = """
+    <div style="position: fixed; bottom: 30px; left: 30px; z-index: 9999;
+                background-color: white; padding: 10px 14px; border: 2px solid #888;
+                border-radius: 6px; font-size: 13px; line-height: 1.6; box-shadow: 2px 2px 6px rgba(0,0,0,0.3);">
+        <b>Legend</b><br>
+        <span style="color:#2A81CB;">&#9899;</span> Port<br>
+        <span style="color:#8fce8f;">&#9873;</span> Near port &lt; 6h &nbsp;
+        <span style="color:#3f9c35;">&#9873;</span> 6&ndash;24h &nbsp;
+        <span style="color:#1a5c14;">&#9873;</span> &gt; 24h<br>
+        <span style="color:#f28b82;">&#9873;</span> Far from port &lt; 6h &nbsp;
+        <span style="color:#e03c31;">&#9873;</span> 6&ndash;24h &nbsp;
+        <span style="color:#8b1a10;">&#9873;</span> &gt; 24h<br>
+        <span style="color:#888; font-weight:bold;">- - -</span> Approach path into stop
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
 
     folium.LayerControl(collapsed=False).add_to(m)
     return m
@@ -339,6 +398,10 @@ if ais_file is not None:
             episodes = detect_stationary_episodes(df, dist_threshold_m, min_gap_hours)
         result = episodes[episodes["total_duration"] >= pd.Timedelta(hours=min_gap_hours)].reset_index(drop=True)
 
+        if len(result) > 0:
+            with st.spinner("Tracing approach paths..."):
+                result = compute_approach_tracks(df, result)
+
         if ports_file is not None and len(result) > 0:
             ports_bytes = ports_file.getvalue()
             with st.spinner("Loading port reference data..."):
@@ -391,7 +454,7 @@ if ais_file is not None:
         col_dl1, col_dl_spacer, col_dl2 = st.columns([2, 3, 2])
         col_dl1.download_button(
             "Near port (CSV)",
-            stops_at_port.to_csv(index=False).encode("utf-8"),
+            stops_at_port.drop(columns=["approach_track"], errors="ignore").to_csv(index=False).encode("utf-8"),
             "stops_at_port.csv",
             "text/csv",
             key="dl_at_port",
@@ -399,7 +462,7 @@ if ais_file is not None:
         )
         col_dl2.download_button(
             "Far from port (CSV)",
-            stops_far_from_port.to_csv(index=False).encode("utf-8"),
+            stops_far_from_port.drop(columns=["approach_track"], errors="ignore").to_csv(index=False).encode("utf-8"),
             "stops_far_from_port.csv",
             "text/csv",
             key="dl_far_port",
