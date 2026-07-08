@@ -98,6 +98,22 @@ def compute_approach_tracks(df, stops_df, lookback_points=5):
     return stops_df
 
 
+@st.cache_data(show_spinner=False)
+def get_time_range(file_bytes, time_col, time_format):
+    """Read just the timestamp column to find the overall min/max date range."""
+    s = pd.read_csv(io.BytesIO(file_bytes), usecols=[time_col])[time_col]
+    if time_format == "Epoch milliseconds":
+        s = pd.to_datetime(s, unit="ms", errors="coerce")
+    elif time_format == "Epoch seconds":
+        s = pd.to_datetime(s, unit="s", errors="coerce")
+    else:
+        s = pd.to_datetime(s, errors="coerce")
+    s = s.dropna()
+    if s.empty:
+        return None, None
+    return s.min(), s.max()
+
+
 def haversine_m(lat1, lon1, lat2, lon2):
     lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
     dlat = lat2 - lat1
@@ -288,25 +304,24 @@ def build_map(ports_df, stops_far_df, stops_near_df):
             ).add_to(far_layer)
     far_layer.add_to(m)
 
-    legend_html = """
-    <div style="position: fixed; bottom: 30px; left: 30px; z-index: 9999;
-                background-color: white; padding: 10px 14px; border: 2px solid #888;
-                border-radius: 6px; font-size: 13px; line-height: 1.6; box-shadow: 2px 2px 6px rgba(0,0,0,0.3);">
-        <b>Legend</b><br>
-        <span style="color:#2A81CB;">&#9899;</span> Port<br>
-        <span style="color:#8fce8f;">&#9873;</span> Near port &lt; 6h &nbsp;
-        <span style="color:#3f9c35;">&#9873;</span> 6&ndash;24h &nbsp;
-        <span style="color:#1a5c14;">&#9873;</span> &gt; 24h<br>
-        <span style="color:#f28b82;">&#9873;</span> Far from port &lt; 6h &nbsp;
-        <span style="color:#e03c31;">&#9873;</span> 6&ndash;24h &nbsp;
-        <span style="color:#8b1a10;">&#9873;</span> &gt; 24h<br>
-        <span style="color:#888; font-weight:bold;">- - -</span> Approach path into stop
-    </div>
-    """
-    m.get_root().html.add_child(folium.Element(legend_html))
-
     folium.LayerControl(collapsed=False).add_to(m)
     return m
+
+
+LEGEND_HTML = """
+<div style="padding: 10px 14px; border: 1px solid #ccc; border-radius: 6px;
+            font-size: 13px; line-height: 1.9; background-color: #fafafa;">
+    <b>Legend</b><br>
+    <span style="display:inline-block;width:12px;height:12px;background:#2A81CB;border-radius:50%;margin-right:6px;"></span>Port<br>
+    <span style="display:inline-block;width:12px;height:12px;background:#8fce8f;border-radius:50%;margin-right:6px;"></span>Near port, stop &lt; 6h<br>
+    <span style="display:inline-block;width:12px;height:12px;background:#3f9c35;border-radius:50%;margin-right:6px;"></span>Near port, stop 6&ndash;24h<br>
+    <span style="display:inline-block;width:12px;height:12px;background:#1a5c14;border-radius:50%;margin-right:6px;"></span>Near port, stop &gt; 24h<br>
+    <span style="display:inline-block;width:12px;height:12px;background:#f28b82;border-radius:50%;margin-right:6px;"></span>Far from port, stop &lt; 6h<br>
+    <span style="display:inline-block;width:12px;height:12px;background:#d63e2a;border-radius:50%;margin-right:6px;"></span>Far from port, stop 6&ndash;24h<br>
+    <span style="display:inline-block;width:12px;height:12px;background:#7a1710;border-radius:50%;margin-right:6px;"></span>Far from port, stop &gt; 24h<br>
+    <span style="color:#888; font-weight:bold;">- - -</span> Approach path leading into a stop
+</div>
+"""
 
 
 # ============================================================
@@ -377,7 +392,20 @@ if ais_file is not None:
         index=guess_time_format(preview_df[time_col]),
     )
 
-    st.sidebar.header("4. Parameters")
+    min_dt, max_dt = get_time_range(ais_bytes, time_col, time_format)
+    if min_dt is not None:
+        st.sidebar.header("4. Date range filter")
+        date_range = st.sidebar.date_input(
+            "Restrict to date range",
+            value=(min_dt.date(), max_dt.date()),
+            min_value=min_dt.date(),
+            max_value=max_dt.date(),
+            help=f"Data spans {min_dt.date()} to {max_dt.date()}.",
+        )
+    else:
+        date_range = None
+
+    st.sidebar.header("5. Parameters")
     dist_threshold_m = st.sidebar.slider("Same-position tolerance (m)", 10, 1000, 100, step=10)
     min_gap_hours = st.sidebar.slider("Minimum stationary duration (hours)", 1, 24, 1)
     port_dist_threshold_m = st.sidebar.slider("Near-port distance threshold (m)", 500, 50000, 5000, step=500)
@@ -391,6 +419,14 @@ if ais_file is not None:
     if run:
         with st.spinner("Loading AIS data..."):
             df = load_ais_csv(ais_bytes, id_col, time_col, lat_col, lon_col, time_format)
+
+        if date_range and len(date_range) == 2:
+            start_date, end_date = date_range
+            df = df[
+                (df["t"] >= pd.Timestamp(start_date))
+                & (df["t"] < pd.Timestamp(end_date) + pd.Timedelta(days=1))
+            ].reset_index(drop=True)
+
         st.session_state.n_rows = len(df)
         st.session_state.n_vessels = df["vessel_id"].nunique()
 
@@ -444,8 +480,22 @@ if ais_file is not None:
         col2.metric("Stops far from any port", len(stops_far_from_port))
 
         st.subheader("🗺️ Interactive map")
-        m = build_map(ports, stops_far_from_port, stops_at_port)
-        folium_static(m, width=1200, height=600)
+
+        all_vessels = sorted(set(stops_at_port["vessel_id"]).union(stops_far_from_port["vessel_id"]))
+        vessel_choice = st.selectbox("Filter map by vessel", ["All vessels"] + all_vessels)
+        if vessel_choice != "All vessels":
+            map_near = stops_at_port[stops_at_port["vessel_id"] == vessel_choice]
+            map_far = stops_far_from_port[stops_far_from_port["vessel_id"] == vessel_choice]
+        else:
+            map_near = stops_at_port
+            map_far = stops_far_from_port
+
+        map_col, legend_col = st.columns([5, 1])
+        with map_col:
+            m = build_map(ports, map_far, map_near)
+            folium_static(m, width=1000, height=600)
+        with legend_col:
+            st.markdown(LEGEND_HTML, unsafe_allow_html=True)
 
         st.markdown(
             "<style>div[data-testid='stDownloadButton'] button {white-space: nowrap;}</style>",
