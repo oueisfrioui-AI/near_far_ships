@@ -240,7 +240,7 @@ def flag_port_stops(episodes_df, ports_df, port_dist_threshold_m):
     return episodes_df
 
 
-def build_map(ports_df, stops_far_df, stops_near_df, fit_to_data=False):
+def build_map(ports_df, stops_far_df, stops_near_df, fit_to_data=False, tile_style="light"):
     if len(stops_far_df) or len(stops_near_df):
         all_lats = pd.concat(
             [stops_far_df["start_lat"], stops_near_df["start_lat"]], ignore_index=True
@@ -253,7 +253,15 @@ def build_map(ports_df, stops_far_df, stops_near_df, fit_to_data=False):
     else:
         center_lat, center_lon = ports_df["port_lat"].mean(), ports_df["port_lon"].mean()
 
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=3, tiles="cartodbpositron")
+    if tile_style == "satellite":
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=3, tiles=None)
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            attr="Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+            name="Satellite",
+        ).add_to(m)
+    else:
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=3, tiles="cartodbpositron")
 
     port_layer = folium.FeatureGroup(name="Ports", show=True)
     port_cluster = MarkerCluster().add_to(port_layer)
@@ -520,7 +528,9 @@ if ais_file is not None:
         st.subheader("🗺️ Interactive map")
 
         all_vessels = sorted(set(stops_at_port["vessel_id"]).union(stops_far_from_port["vessel_id"]))
-        vessel_choice = st.selectbox("Filter map by vessel", ["All vessels"] + all_vessels)
+        picker_col1, picker_col2 = st.columns([2, 1])
+        vessel_choice = picker_col1.selectbox("Filter map by vessel", ["All vessels"] + all_vessels)
+        map_style = picker_col2.radio("Map style", ["Light", "Satellite"], horizontal=True)
         if vessel_choice != "All vessels":
             map_near = stops_at_port[stops_at_port["vessel_id"] == vessel_choice]
             map_far = stops_far_from_port[stops_far_from_port["vessel_id"] == vessel_choice]
@@ -530,7 +540,11 @@ if ais_file is not None:
 
         map_col, legend_col = st.columns([5, 1])
         with map_col:
-            m = build_map(ports, map_far, map_near, fit_to_data=(vessel_choice != "All vessels"))
+            m = build_map(
+                ports, map_far, map_near,
+                fit_to_data=(vessel_choice != "All vessels"),
+                tile_style=map_style.lower(),
+            )
             folium_static(m, width=1000, height=600)
         with legend_col:
             st.markdown(LEGEND_HTML, unsafe_allow_html=True)
