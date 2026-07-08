@@ -26,6 +26,24 @@ EARTH_RADIUS_M = 6371000.0
 # ============================================================
 # Helper functions
 # ============================================================
+def guess_time_format(sample_series):
+    """Inspect a sample of raw timestamp values and guess whether they're
+    epoch milliseconds, epoch seconds, or a date string, based on magnitude.
+    Returns the index matching the Timestamp format selectbox options."""
+    sample = sample_series.dropna().astype(str).str.strip()
+    sample = sample[sample != ""]
+    if sample.empty:
+        return 0
+    numeric = pd.to_numeric(sample, errors="coerce")
+    if numeric.notna().all():
+        median_val = numeric.median()
+        if median_val > 1e12:
+            return 1  # Epoch milliseconds (~13 digits, e.g. 1700000000000)
+        elif median_val > 1e9:
+            return 2  # Epoch seconds (~10 digits, e.g. 1700000000)
+    return 0  # Auto-detect (date string)
+
+
 def guess_column(columns, candidates):
     """Case-insensitive match of column names against a list of likely candidates.
     Returns the index of the best match in `columns`, or 0 if nothing matches."""
@@ -273,7 +291,8 @@ ports_file = st.sidebar.file_uploader("Ports CSV file", type=["csv"])
 
 if ais_file is not None:
     ais_bytes = ais_file.getvalue()
-    preview_cols = pd.read_csv(io.BytesIO(ais_bytes), nrows=5).columns.tolist()
+    preview_df = pd.read_csv(io.BytesIO(ais_bytes), nrows=20)
+    preview_cols = preview_df.columns.tolist()
 
     st.sidebar.header("3. Map your columns")
     id_col = st.sidebar.selectbox(
@@ -295,7 +314,8 @@ if ais_file is not None:
     )
 
     time_format = st.sidebar.selectbox(
-        "Timestamp format", ["Auto-detect (date string)", "Epoch milliseconds", "Epoch seconds"]
+        "Timestamp format", ["Auto-detect (date string)", "Epoch milliseconds", "Epoch seconds"],
+        index=guess_time_format(preview_df[time_col]),
     )
 
     st.sidebar.header("4. Parameters")
