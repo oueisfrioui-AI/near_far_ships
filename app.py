@@ -124,6 +124,88 @@ def get_time_range(file_bytes, time_col, time_format):
     return s.min(), s.max()
 
 
+@st.cache_data(show_spinner=False)
+def detect_sts_candidates(stops_far_df, max_distance_m=150, min_overlap_hours=1.0):
+    """Find pairs of DIFFERENT vessels whose far-from-port stops were both
+    close together in space AND overlapping in time - a signal consistent
+    with a ship-to-ship transfer (as opposed to two ships coincidentally
+    sheltering in the same general area at different times)."""
+    df = stops_far_df.reset_index(drop=True)
+    if len(df) < 2:
+        return pd.DataFrame()
+
+    coords_rad = np.radians(df[["start_lat", "start_lon"]].values)
+    tree = BallTree(coords_rad, metric="haversine")
+    radius_rad = max_distance_m / EARTH_RADIUS_M
+    neighbor_lists = tree.query_radius(coords_rad, r=radius_rad)
+
+    pairs = []
+    seen = set()
+    for i, neighbors in enumerate(neighbor_lists):
+        for j in neighbors:
+            j = int(j)
+            if j <= i or (i, j) in seen:
+                continue
+            seen.add((i, j))
+            if df.loc[i, "vessel_id"] == df.loc[j, "vessel_id"]:
+                continue
+            start_i, end_i = df.loc[i, "episode_start"], df.loc[i, "episode_end"]
+            start_j, end_j = df.loc[j, "episode_start"], df.loc[j, "episode_end"]
+            overlap_start = max(start_i, start_j)
+            overlap_end = min(end_i, end_j)
+            overlap_hours = (overlap_end - overlap_start).total_seconds() / 3600
+            if overlap_hours < min_overlap_hours:
+                continue
+            dist_m = haversine_m(
+                df.loc[i, "start_lat"], df.loc[i, "start_lon"], df.loc[j, "start_lat"], df.loc[j, "start_lon"]
+            )
+            pairs.append({
+                "vessel_a": df.loc[i, "vessel_id"], "lat_a": df.loc[i, "start_lat"], "lon_a": df.loc[i, "start_lon"],
+                "vessel_b": df.loc[j, "vessel_id"], "lat_b": df.loc[j, "start_lat"], "lon_b": df.loc[j, "start_lon"],
+                "mid_lat": (df.loc[i, "start_lat"] + df.loc[j, "start_lat"]) / 2,
+                "mid_lon": (df.loc[i, "start_lon"] + df.loc[j, "start_lon"]) / 2,
+                "distance_m": dist_m,
+                "overlap_start": overlap_start,
+                "overlap_end": overlap_end,
+                "overlap_hours": overlap_hours,
+            })
+    return pd.DataFrame(pairs)
+
+
+@st.cache_data(show_spinner=False)
+def score_sts_candidates(pairs_df, stops_far_df, max_distance_m, isolation_radius_m=1000, overlap_cap_hours=24):
+    """Score each candidate pair on three factors:
+    - how close together they were (closer = more suspicious)
+    - how long their stops overlapped (longer = more suspicious)
+    - how isolated that location is (few other vessels ever stop nearby = more
+      suspicious; a spot where many different vessels stop is more likely a
+      known shelter/waiting area than a private transfer point)."""
+    if pairs_df.empty:
+        return pairs_df
+
+    pairs_df = pairs_df.copy()
+    all_coords_rad = np.radians(stops_far_df[["start_lat", "start_lon"]].values)
+    all_tree = BallTree(all_coords_rad, metric="haversine")
+    isolation_radius_rad = isolation_radius_m / EARTH_RADIUS_M
+
+    nearby_vessel_counts = []
+    for _, row in pairs_df.iterrows():
+        pt_rad = np.radians([[row["mid_lat"], row["mid_lon"]]])
+        idx = all_tree.query_radius(pt_rad, r=isolation_radius_rad)[0]
+        nearby_vessel_counts.append(stops_far_df.iloc[idx]["vessel_id"].nunique())
+    pairs_df["vessels_nearby"] = nearby_vessel_counts
+
+    pairs_df["distance_score"] = (1 - (pairs_df["distance_m"] / max_distance_m)).clip(0, 1)
+    pairs_df["overlap_score"] = (pairs_df["overlap_hours"] / overlap_cap_hours).clip(0, 1)
+    # 2 nearby vessels = just this pair (fully isolated, score 1); decays toward 0 by +8 more vessels
+    pairs_df["isolation_score"] = (1 - ((pairs_df["vessels_nearby"] - 2) / 8)).clip(0, 1)
+
+    pairs_df["score"] = (
+        0.4 * pairs_df["distance_score"] + 0.4 * pairs_df["overlap_score"] + 0.2 * pairs_df["isolation_score"]
+    )
+    return pairs_df.sort_values("score", ascending=False).reset_index(drop=True)
+
+
 def haversine_m(lat1, lon1, lat2, lon2):
     lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
     dlat = lat2 - lat1
@@ -240,7 +322,7 @@ def flag_port_stops(episodes_df, ports_df, port_dist_threshold_m):
     return episodes_df
 
 
-def build_map(ports_df, stops_far_df, stops_near_df, fit_to_data=False, tile_style="light"):
+def build_map(ports_df, stops_far_df, stops_near_df, fit_to_data=False, tile_style="light", sts_pairs_df=None):
     if len(stops_far_df) or len(stops_near_df):
         all_lats = pd.concat(
             [stops_far_df["start_lat"], stops_near_df["start_lat"]], ignore_index=True
@@ -326,6 +408,31 @@ def build_map(ports_df, stops_far_df, stops_near_df, fit_to_data=False, tile_sty
             ).add_to(far_layer)
     far_layer.add_to(m)
 
+    if sts_pairs_df is not None and len(sts_pairs_df):
+        sts_layer = folium.FeatureGroup(name="Potential ship-to-ship transfers", show=True)
+        for _, row in sts_pairs_df.iterrows():
+            folium.PolyLine(
+                locations=[[row["lat_a"], row["lon_a"]], [row["lat_b"], row["lon_b"]]],
+                color="purple", weight=3, opacity=0.85,
+            ).add_to(sts_layer)
+            popup_html = (
+                "<div style='word-wrap: break-word; overflow-wrap: break-word; white-space: normal; max-width: 260px;'>"
+                f"<b>Vessel A:</b> {row['vessel_a']}<br>"
+                f"<b>Vessel B:</b> {row['vessel_b']}<br>"
+                f"<b>Distance apart:</b> {row['distance_m']:.0f} m<br>"
+                f"<b>Overlap:</b> {row['overlap_hours']:.1f} h "
+                f"({row['overlap_start']} &rarr; {row['overlap_end']})<br>"
+                f"<b>Suspicion score:</b> {row['score']:.2f}"
+                "</div>"
+            )
+            folium.CircleMarker(
+                location=[row["mid_lat"], row["mid_lon"]],
+                radius=7, color="purple", fill=True, fill_opacity=0.9,
+                popup=folium.Popup(popup_html, max_width=300),
+                tooltip=f"{row['vessel_a']} \u2194 {row['vessel_b']} (score {row['score']:.2f})",
+            ).add_to(sts_layer)
+        sts_layer.add_to(m)
+
     if fit_to_data:
         bounds = []
         for df_ in (stops_near_df, stops_far_df):
@@ -352,7 +459,8 @@ LEGEND_HTML = """
     <span style="display:inline-block;width:12px;height:12px;background:#f28b82;border-radius:50%;margin-right:6px;"></span>Far from port, stop &lt; 6h<br>
     <span style="display:inline-block;width:12px;height:12px;background:#d63e2a;border-radius:50%;margin-right:6px;"></span>Far from port, stop 6&ndash;24h<br>
     <span style="display:inline-block;width:12px;height:12px;background:#7a1710;border-radius:50%;margin-right:6px;"></span>Far from port, stop &gt; 24h<br>
-    <span style="color:#888; font-weight:bold;">- - -</span> Approach path leading into a stop
+    <span style="color:#888; font-weight:bold;">- - -</span> Approach path leading into a stop<br>
+    <span style="color:#8e24aa; font-weight:bold;">&#9679;&#8212;&#9679;</span> Potential ship-to-ship transfer
 </div>
 """
 
@@ -380,6 +488,8 @@ if "n_vessels" not in st.session_state:
     st.session_state.n_vessels = None
 if "map_cache" not in st.session_state:
     st.session_state.map_cache = {}
+if "sts_pairs" not in st.session_state:
+    st.session_state.sts_pairs = None
 
 
 # ============================================================
@@ -445,6 +555,11 @@ if ais_file is not None:
     min_gap_hours = st.sidebar.slider("Minimum stationary duration (hours)", 1, 24, 1)
     port_dist_threshold_m = st.sidebar.slider("Near-port distance threshold (m)", 500, 50000, 5000, step=500)
 
+    st.sidebar.header("6. Ship-to-ship transfer detection")
+    st.sidebar.caption("Flags pairs of different vessels stopped close together, far from any port, with overlapping stop times.")
+    sts_max_distance_m = st.sidebar.slider("Max distance between vessels (m)", 20, 500, 150, step=10)
+    sts_min_overlap_hours = st.sidebar.slider("Min overlapping stop duration (hours)", 0.5, 12.0, 1.0, step=0.5)
+
     run = st.sidebar.button("Run analysis", type="primary")
 
     # --- Only (re)compute when the button is actually clicked. -------------
@@ -485,11 +600,25 @@ if ais_file is not None:
             st.session_state.stops_at_port = result[result["at_port"]].reset_index(drop=True)
             st.session_state.stops_far_from_port = result[~result["at_port"]].reset_index(drop=True)
             st.session_state.result = None
+
+            with st.spinner("Scanning for ship-to-ship transfer candidates..."):
+                sts_pairs = detect_sts_candidates(
+                    st.session_state.stops_far_from_port,
+                    max_distance_m=sts_max_distance_m,
+                    min_overlap_hours=sts_min_overlap_hours,
+                )
+                sts_pairs = score_sts_candidates(
+                    sts_pairs,
+                    st.session_state.stops_far_from_port,
+                    max_distance_m=sts_max_distance_m,
+                )
+            st.session_state.sts_pairs = sts_pairs
         else:
             st.session_state.result = result
             st.session_state.ports = None
             st.session_state.stops_at_port = None
             st.session_state.stops_far_from_port = None
+            st.session_state.sts_pairs = None
 
     # --- Render from session_state (independent of the button value). ------
     if st.session_state.n_rows is not None:
@@ -505,6 +634,7 @@ if ais_file is not None:
         stops_at_port = st.session_state.stops_at_port
         stops_far_from_port = st.session_state.stops_far_from_port
         ports = st.session_state.ports
+        sts_pairs = st.session_state.sts_pairs
 
         st.success(
             f"Found {len(stops_at_port) + len(stops_far_from_port):,} stationary "
@@ -537,9 +667,16 @@ if ais_file is not None:
         if vessel_choice != "All vessels":
             map_near = stops_at_port[stops_at_port["vessel_id"] == vessel_choice]
             map_far = stops_far_from_port[stops_far_from_port["vessel_id"] == vessel_choice]
+            if sts_pairs is not None and len(sts_pairs):
+                map_sts = sts_pairs[
+                    (sts_pairs["vessel_a"] == vessel_choice) | (sts_pairs["vessel_b"] == vessel_choice)
+                ]
+            else:
+                map_sts = sts_pairs
         else:
             map_near = stops_at_port
             map_far = stops_far_from_port
+            map_sts = sts_pairs
 
         map_col, legend_col = st.columns([5, 1])
         with map_col:
@@ -549,6 +686,7 @@ if ais_file is not None:
                     ports, map_far, map_near,
                     fit_to_data=(vessel_choice != "All vessels"),
                     tile_style=map_style.lower(),
+                    sts_pairs_df=map_sts,
                 )
             m = st.session_state.map_cache[cache_key]
             folium_static(m, width=1000, height=600)
@@ -576,6 +714,33 @@ if ais_file is not None:
             key="dl_far_port",
             use_container_width=True,
         )
+
+        st.subheader("🔗 Potential ship-to-ship transfers")
+        st.caption(
+            "Pairs of different vessels stopped far from any port, within "
+            f"{sts_max_distance_m} m of each other, with stop windows overlapping "
+            f"at least {sts_min_overlap_hours}h. Ranked by a suspicion score "
+            "combining distance, overlap duration, and how isolated the spot is."
+        )
+        if sts_pairs is not None and len(sts_pairs):
+            st.metric("Candidate pairs found", len(sts_pairs))
+            display_cols = [
+                "vessel_a", "vessel_b", "distance_m", "overlap_hours",
+                "overlap_start", "overlap_end", "vessels_nearby", "score",
+            ]
+            st.dataframe(
+                sts_pairs[display_cols].round({"distance_m": 0, "overlap_hours": 1, "score": 2}),
+                use_container_width=True,
+            )
+            st.download_button(
+                "Ship-to-ship candidates (CSV)",
+                sts_pairs.to_csv(index=False).encode("utf-8"),
+                "sts_candidates.csv",
+                "text/csv",
+                key="dl_sts",
+            )
+        else:
+            st.info("No ship-to-ship transfer candidates found with the current thresholds.")
 
     elif has_plain_result:
         result = st.session_state.result
