@@ -76,6 +76,15 @@ def fmt_duration(td):
     return f"{hours:.1f} h"
 
 
+def shorten_id(vessel_id, keep=4):
+    """Shorten a long vessel identifier for display purposes only, e.g.
+    '123456789' -> '1234…6789'. Leaves short IDs untouched."""
+    s = str(vessel_id)
+    if len(s) <= keep * 2 + 1:
+        return s
+    return f"{s[:keep]}\u2026{s[-keep:]}"
+
+
 def duration_marker_color(total_duration, base):
     """Pick a shade of the base color (green/red) based on how long the stop
     lasted: light = short, normal = medium, dark = long."""
@@ -723,15 +732,35 @@ if ais_file is not None:
             "combining distance, overlap duration, and how isolated the spot is."
         )
         if sts_pairs is not None and len(sts_pairs):
-            st.metric("Candidate pairs found", len(sts_pairs))
+            metric_col, toggle_col = st.columns([3, 1])
+            metric_col.metric("Candidate pairs found", len(sts_pairs))
+            show_full_ids = toggle_col.checkbox("Show full vessel IDs", value=False, key="sts_full_ids")
+
             display_cols = [
                 "vessel_a", "vessel_b", "distance_m", "overlap_hours",
                 "overlap_start", "overlap_end", "vessels_nearby", "score",
             ]
-            st.dataframe(
-                sts_pairs[display_cols].round({"distance_m": 0, "overlap_hours": 1, "score": 2}),
-                use_container_width=True,
+            sts_display = sts_pairs[display_cols].round(
+                {"distance_m": 0, "overlap_hours": 1, "score": 2}
             )
+            if not show_full_ids:
+                sts_display["vessel_a"] = sts_display["vessel_a"].apply(shorten_id)
+                sts_display["vessel_b"] = sts_display["vessel_b"].apply(shorten_id)
+
+            st.dataframe(
+                sts_display,
+                use_container_width=True,
+                column_config={
+                    "vessel_a": st.column_config.TextColumn("Vessel A", width="small"),
+                    "vessel_b": st.column_config.TextColumn("Vessel B", width="small"),
+                    "distance_m": st.column_config.NumberColumn("Distance (m)", width="small"),
+                    "overlap_hours": st.column_config.NumberColumn("Overlap (h)", width="small"),
+                    "vessels_nearby": st.column_config.NumberColumn("Nearby vessels", width="small"),
+                    "score": st.column_config.NumberColumn("Score", width="small"),
+                },
+            )
+            if not show_full_ids:
+                st.caption("Vessel IDs shortened for readability — tick \"Show full vessel IDs\" or use the CSV download for the complete values.")
             st.download_button(
                 "Ship-to-ship candidates (CSV)",
                 sts_pairs.to_csv(index=False).encode("utf-8"),
