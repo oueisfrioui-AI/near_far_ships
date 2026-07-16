@@ -1130,3 +1130,4 @@ if ais_file is not None:
 
 else:
     st.info("Upload an AIS CSV file in the sidebar to get started.")
+
