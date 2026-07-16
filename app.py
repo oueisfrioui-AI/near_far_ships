@@ -1,4 +1,3 @@
-cat > /home/claude/ais_app/app.py << 'PYEOF'
 """
 AIS Stationary Ship Detector
 -----------------------------
