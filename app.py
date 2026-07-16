@@ -3,7 +3,8 @@ AIS Stationary Ship Detector
 -----------------------------
 Upload an AIS CSV, map your columns, and detect ships that stopped for
 at least N hours - classified as near-port or far-from-port - shown on
-an interactive map.
+an interactive map. Also detects "dark" vessels (AIS gaps of N+ hours),
+accounting for regions with naturally low/no AIS coverage.
 
 Run with:
     streamlit run app.py
@@ -95,6 +96,14 @@ def duration_marker_color(total_duration, base):
         return base
     else:
         return f"dark{base}"
+
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    return 2 * EARTH_RADIUS_M * np.arcsin(np.sqrt(a))
 
 
 @st.cache_data(show_spinner=False)
@@ -215,14 +224,6 @@ def score_sts_candidates(pairs_df, stops_far_df, max_distance_m, isolation_radiu
     return pairs_df.sort_values("score", ascending=False).reset_index(drop=True)
 
 
-def haversine_m(lat1, lon1, lat2, lon2):
-    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
-    return 2 * EARTH_RADIUS_M * np.arcsin(np.sqrt(a))
-
-
 @st.cache_data(show_spinner=False)
 def load_ais_csv(file_bytes, id_col, time_col, lat_col, lon_col, time_format):
     """Load only the needed columns, with memory-efficient dtypes."""
@@ -331,7 +332,159 @@ def flag_port_stops(episodes_df, ports_df, port_dist_threshold_m):
     return episodes_df
 
 
-def build_map(ports_df, stops_far_df, stops_near_df, fit_to_data=False, tile_style="light", sts_pairs_df=None):
+# ============================================================
+# Dark vessel detection
+# ============================================================
+@st.cache_data(show_spinner=False)
+def compute_region_bounds(df, edge_margin_pct=5):
+    """Bounding box of the whole uploaded dataset, plus an inward margin band.
+    Used to flag when a vessel's last known position was near the edge of the
+    monitored region - since a dataset that only covers a region (not the
+    whole globe) cannot distinguish 'went dark' from 'sailed outside the area
+    we have any visibility into' once a vessel nears that edge."""
+    lat_min, lat_max = float(df["lat"].min()), float(df["lat"].max())
+    lon_min, lon_max = float(df["lon"].min()), float(df["lon"].max())
+    lat_margin = (lat_max - lat_min) * (edge_margin_pct / 100)
+    lon_margin = (lon_max - lon_min) * (edge_margin_pct / 100)
+    return {
+        "lat_min": lat_min, "lat_max": lat_max,
+        "lon_min": lon_min, "lon_max": lon_max,
+        "lat_margin": lat_margin, "lon_margin": lon_margin,
+    }
+
+
+def is_near_region_edge(lat, lon, bounds):
+    """Vectorized check: is this point within the inward margin band of the
+    dataset's overall bounding box?"""
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    return (
+        (lat <= bounds["lat_min"] + bounds["lat_margin"]) |
+        (lat >= bounds["lat_max"] - bounds["lat_margin"]) |
+        (lon <= bounds["lon_min"] + bounds["lon_margin"]) |
+        (lon >= bounds["lon_max"] - bounds["lon_margin"])
+    )
+
+
+@st.cache_data(show_spinner=False)
+def build_coverage_grid(df, grid_size_deg):
+    """Estimate typical AIS reporting density per grid cell using the WHOLE
+    fleet's pings (not just one vessel) - a self-calibrating proxy for how
+    well-covered an area is by AIS receivers/satellites. In cells where many
+    different vessels' reports arrive close together in time, the area is
+    'well covered'; in cells where reports (from anyone) are naturally sparse,
+    the area has 'low coverage', making a long silence from one vessel there
+    much less suspicious."""
+    d = df[["t", "lat", "lon"]].copy()
+    d["cell_lat"] = np.floor(d["lat"].astype("float64") / grid_size_deg) * grid_size_deg
+    d["cell_lon"] = np.floor(d["lon"].astype("float64") / grid_size_deg) * grid_size_deg
+    d = d.sort_values(["cell_lat", "cell_lon", "t"])
+    d["gap_any_vessel_hours"] = (
+        d.groupby(["cell_lat", "cell_lon"])["t"].diff().dt.total_seconds() / 3600
+    )
+
+    grid = d.groupby(["cell_lat", "cell_lon"]).agg(
+        n_reports=("t", "size"),
+        median_gap_hours=("gap_any_vessel_hours", "median"),
+    ).reset_index()
+    return grid
+
+
+def lookup_cell_coverage(lat, lon, grid_size_deg, coverage_grid):
+    """For arrays of lat/lon, look up each point's grid cell coverage stats."""
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    cell_lat = np.floor(lat / grid_size_deg) * grid_size_deg
+    cell_lon = np.floor(lon / grid_size_deg) * grid_size_deg
+    lookup_df = pd.DataFrame({"cell_lat": cell_lat, "cell_lon": cell_lon})
+    merged = lookup_df.merge(coverage_grid, on=["cell_lat", "cell_lon"], how="left")
+    return merged["n_reports"].values, merged["median_gap_hours"].values
+
+
+@st.cache_data(show_spinner=False)
+def detect_dark_gaps(df, dark_threshold_hours):
+    """Find gaps in AIS reporting per vessel of at least dark_threshold_hours,
+    regardless of whether position changed in between - candidate 'went dark'
+    events. Also records how far the vessel appears to have moved between its
+    last report and its reappearance, since large displacement over a long
+    silence is itself informative (still moving vs. sitting still and dark)."""
+    g = df.groupby("vessel_id", sort=False)
+    d = df.copy()
+    d["prev_time"] = g["t"].shift()
+    d["prev_lat"] = g["lat"].shift()
+    d["prev_lon"] = g["lon"].shift()
+    d["gap_hours"] = (d["t"] - d["prev_time"]).dt.total_seconds() / 3600
+    d = d.dropna(subset=["prev_time"])
+
+    dark = d[d["gap_hours"] >= dark_threshold_hours][
+        ["vessel_id", "prev_time", "prev_lat", "prev_lon", "t", "lat", "lon", "gap_hours"]
+    ].rename(columns={
+        "prev_time": "last_seen_time", "prev_lat": "last_seen_lat", "prev_lon": "last_seen_lon",
+        "t": "reappear_time", "lat": "reappear_lat", "lon": "reappear_lon",
+    }).reset_index(drop=True)
+
+    if dark.empty:
+        return dark.assign(displacement_m=[])
+
+    dark["displacement_m"] = haversine_m(
+        dark["last_seen_lat"], dark["last_seen_lon"], dark["reappear_lat"], dark["reappear_lon"]
+    )
+    return dark
+
+
+@st.cache_data(show_spinner=False)
+def classify_dark_gaps(dark_df, coverage_grid, bounds, grid_size_deg, well_covered_gap_hours, min_reports_per_cell):
+    """Classify each dark-gap event into one of four buckets, checked in this
+    order (first match wins):
+
+    1. Possibly left monitored area - the vessel's last known position was near
+       the edge of the dataset's overall bounding box, so we cannot tell
+       whether it went dark or simply sailed outside our visibility.
+    2. Insufficient coverage data - too few historical reports (from any
+       vessel) in that grid cell to trust a coverage estimate either way.
+    3. Likely dark (AIS off) - the cell is normally well-reported (typical
+       gap <= well_covered_gap_hours) yet this vessel went silent much longer.
+    4. Likely coverage gap - the cell is naturally sparse for everyone, so a
+       long silence there isn't surprising on its own.
+    """
+    if dark_df.empty:
+        return dark_df.assign(
+            near_region_edge=[], cell_n_reports=[], cell_median_gap_hours=[], classification=[]
+        )
+
+    dark_df = dark_df.copy()
+
+    near_edge = is_near_region_edge(dark_df["last_seen_lat"].values, dark_df["last_seen_lon"].values, bounds)
+    dark_df["near_region_edge"] = near_edge
+
+    n_reports, median_gap_hours = lookup_cell_coverage(
+        dark_df["last_seen_lat"].values, dark_df["last_seen_lon"].values, grid_size_deg, coverage_grid
+    )
+    dark_df["cell_n_reports"] = n_reports
+    dark_df["cell_median_gap_hours"] = median_gap_hours
+
+    insufficient = (
+        dark_df["cell_n_reports"].isna()
+        | (dark_df["cell_n_reports"] < min_reports_per_cell)
+        | dark_df["cell_median_gap_hours"].isna()
+    )
+    well_covered = dark_df["cell_median_gap_hours"] <= well_covered_gap_hours
+
+    conditions = [
+        dark_df["near_region_edge"],
+        insufficient,
+        well_covered,
+    ]
+    choices = ["Possibly left monitored area", "Insufficient coverage data", "Likely dark (AIS off)"]
+    dark_df["classification"] = np.select(conditions, choices, default="Likely coverage gap")
+
+    return dark_df.sort_values("gap_hours", ascending=False).reset_index(drop=True)
+
+
+def build_map(
+    ports_df, stops_far_df, stops_near_df, fit_to_data=False, tile_style="light",
+    sts_pairs_df=None, dark_df=None, dark_categories_to_show=None, show_region_bounds=None,
+):
     if len(stops_far_df) or len(stops_near_df):
         all_lats = pd.concat(
             [stops_far_df["start_lat"], stops_near_df["start_lat"]], ignore_index=True
@@ -442,6 +595,64 @@ def build_map(ports_df, stops_far_df, stops_near_df, fit_to_data=False, tile_sty
             ).add_to(sts_layer)
         sts_layer.add_to(m)
 
+    dark_colors = {
+        "Likely dark (AIS off)": "black",
+        "Likely coverage gap": "orange",
+        "Possibly left monitored area": "gray",
+        "Insufficient coverage data": "lightgray",
+    }
+    if dark_df is not None and len(dark_df) and dark_categories_to_show:
+        for category in dark_categories_to_show:
+            subset = dark_df[dark_df["classification"] == category]
+            if not len(subset):
+                continue
+            color = dark_colors.get(category, "black")
+            layer = folium.FeatureGroup(name=f"Dark vessels: {category}", show=(category == "Likely dark (AIS off)"))
+            for _, row in subset.iterrows():
+                if pd.isna(row["cell_median_gap_hours"]):
+                    typical_gap_str = "n/a"
+                else:
+                    typical_gap_str = f"{row['cell_median_gap_hours']:.1f} h"
+
+                popup_html = (
+                    "<div style='word-wrap: break-word; overflow-wrap: break-word; white-space: normal; max-width: 260px;'>"
+                    f"<b>Vessel:</b> {row['vessel_id']}<br>"
+                    f"<b>Classification:</b> {row['classification']}<br>"
+                    f"<b>Last seen:</b> {row['last_seen_time']}<br>"
+                    f"<b>Reappeared:</b> {row['reappear_time']}<br>"
+                    f"<b>Silence:</b> {row['gap_hours']:.1f} h<br>"
+                    f"<b>Displacement while dark:</b> {row['displacement_m']:.0f} m<br>"
+                    f"<b>Typical local reporting gap:</b> {typical_gap_str}"
+                    "</div>"
+                )
+                folium.PolyLine(
+                    locations=[[row["last_seen_lat"], row["last_seen_lon"]], [row["reappear_lat"], row["reappear_lon"]]],
+                    color=color, weight=2, opacity=0.7, dash_array="2,8",
+                ).add_to(layer)
+                folium.CircleMarker(
+                    location=[row["last_seen_lat"], row["last_seen_lon"]],
+                    radius=6, color=color, fill=True, fill_opacity=0.9,
+                    popup=folium.Popup(popup_html, max_width=300),
+                    tooltip=f"{row['vessel_id']} \u2014 {row['classification']}",
+                ).add_to(layer)
+            layer.add_to(m)
+
+    if show_region_bounds:
+        b = show_region_bounds
+        folium.Rectangle(
+            bounds=[[b["lat_min"], b["lon_min"]], [b["lat_max"], b["lon_max"]]],
+            color="steelblue", weight=1.5, fill=False, dash_array="6,4",
+            tooltip="Dataset bounding box",
+        ).add_to(m)
+        folium.Rectangle(
+            bounds=[
+                [b["lat_min"] + b["lat_margin"], b["lon_min"] + b["lon_margin"]],
+                [b["lat_max"] - b["lat_margin"], b["lon_max"] - b["lon_margin"]],
+            ],
+            color="steelblue", weight=1, fill=False, dash_array="2,6", opacity=0.6,
+            tooltip="Edge margin - stops here may just have left the monitored area",
+        ).add_to(m)
+
     if fit_to_data:
         bounds = []
         for df_ in (stops_near_df, stops_far_df):
@@ -469,7 +680,11 @@ LEGEND_HTML = """
     <span style="display:inline-block;width:12px;height:12px;background:#d63e2a;border-radius:50%;margin-right:6px;"></span>Far from port, stop 6&ndash;24h<br>
     <span style="display:inline-block;width:12px;height:12px;background:#7a1710;border-radius:50%;margin-right:6px;"></span>Far from port, stop &gt; 24h<br>
     <span style="color:#888; font-weight:bold;">- - -</span> Approach path leading into a stop<br>
-    <span style="color:#8e24aa; font-weight:bold;">&#9679;&#8212;&#9679;</span> Potential ship-to-ship transfer
+    <span style="color:#8e24aa; font-weight:bold;">&#9679;&#8212;&#9679;</span> Potential ship-to-ship transfer<br>
+    <span style="display:inline-block;width:12px;height:12px;background:#111;border-radius:50%;margin-right:6px;"></span>Likely dark (AIS off)<br>
+    <span style="display:inline-block;width:12px;height:12px;background:#e67e22;border-radius:50%;margin-right:6px;"></span>Likely coverage gap<br>
+    <span style="display:inline-block;width:12px;height:12px;background:#888;border-radius:50%;margin-right:6px;"></span>Possibly left monitored area<br>
+    <span style="display:inline-block;width:12px;height:12px;background:#ccc;border-radius:50%;margin-right:6px;"></span>Insufficient coverage data
 </div>
 """
 
@@ -483,22 +698,13 @@ LEGEND_HTML = """
 # script) don't wipe out what's on screen. st.button() only returns True on
 # the single run where the click happened, so gating the results display on
 # it directly is what was causing the "reset" behaviour.
-if "result" not in st.session_state:
-    st.session_state.result = None          # full episodes dataframe (no port match)
-if "stops_at_port" not in st.session_state:
-    st.session_state.stops_at_port = None
-if "stops_far_from_port" not in st.session_state:
-    st.session_state.stops_far_from_port = None
-if "ports" not in st.session_state:
-    st.session_state.ports = None
-if "n_rows" not in st.session_state:
-    st.session_state.n_rows = None
-if "n_vessels" not in st.session_state:
-    st.session_state.n_vessels = None
-if "map_cache" not in st.session_state:
-    st.session_state.map_cache = {}
-if "sts_pairs" not in st.session_state:
-    st.session_state.sts_pairs = None
+for key, default in [
+    ("result", None), ("stops_at_port", None), ("stops_far_from_port", None),
+    ("ports", None), ("n_rows", None), ("n_vessels", None), ("map_cache", {}),
+    ("sts_pairs", None), ("dark_gaps", None), ("region_bounds", None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
 # ============================================================
@@ -507,7 +713,9 @@ if "sts_pairs" not in st.session_state:
 st.title("🚢 AIS Stationary Ship Detector")
 st.write(
     "Upload an AIS CSV, map your columns, and find ships that stayed in place "
-    "for at least N hours - split into stops near a port and stops far from any port."
+    "for at least N hours - split into stops near a port and stops far from any port. "
+    "Also flags vessels that went quiet (\"dark\") for an extended period, "
+    "accounting for areas with naturally low AIS coverage."
 )
 
 st.sidebar.header("1. Upload AIS data")
@@ -559,7 +767,7 @@ if ais_file is not None:
     else:
         date_range = None
 
-    st.sidebar.header("5. Parameters")
+    st.sidebar.header("5. Stationary stop parameters")
     dist_threshold_m = st.sidebar.slider("Same-position tolerance (m)", 10, 1000, 100, step=10)
     min_gap_hours = st.sidebar.slider("Minimum stationary duration (hours)", 1, 24, 1)
     port_dist_threshold_m = st.sidebar.slider("Near-port distance threshold (m)", 500, 50000, 5000, step=500)
@@ -568,6 +776,30 @@ if ais_file is not None:
     st.sidebar.caption("Flags pairs of different vessels stopped close together, far from any port, with overlapping stop times.")
     sts_max_distance_m = st.sidebar.slider("Max distance between vessels (m)", 20, 500, 150, step=10)
     sts_min_overlap_hours = st.sidebar.slider("Min overlapping stop duration (hours)", 0.5, 12.0, 1.0, step=0.5)
+
+    st.sidebar.header("7. Dark vessel detection")
+    st.sidebar.caption(
+        "Flags vessels that stopped transmitting AIS for an extended period. "
+        "Classification accounts for areas with naturally low AIS coverage and "
+        "for vessels that may simply have left the region this dataset covers."
+    )
+    dark_threshold_hours = st.sidebar.slider("Dark threshold (hours)", 1, 48, 8)
+    coverage_grid_size_deg = st.sidebar.select_slider(
+        "Coverage grid cell size (degrees)", options=[0.1, 0.25, 0.5, 1.0, 2.0], value=0.5,
+        help="Smaller cells = finer-grained coverage estimate, but need more data per cell to be reliable.",
+    )
+    well_covered_gap_hours = st.sidebar.slider(
+        "Well-covered area: max typical gap (hours)", 0.5, 6.0, 2.0, step=0.5,
+        help="If the typical reporting gap in a cell (from ANY vessel) is at or below this, the area counts as well-covered.",
+    )
+    min_reports_per_cell = st.sidebar.slider(
+        "Min reports per cell for confidence", 5, 200, 20, step=5,
+        help="Cells with fewer historical reports than this are marked 'insufficient data' rather than guessed at.",
+    )
+    edge_margin_pct = st.sidebar.slider(
+        "Region-edge margin (% of bounding box)", 1, 20, 5,
+        help="Stops whose last known position falls within this margin of the dataset's outer edge are treated as 'possibly left the monitored area' rather than dark.",
+    )
 
     run = st.sidebar.button("Run analysis", type="primary")
 
@@ -629,6 +861,19 @@ if ais_file is not None:
             st.session_state.stops_far_from_port = None
             st.session_state.sts_pairs = None
 
+        with st.spinner("Computing region bounds..."):
+            bounds = compute_region_bounds(df, edge_margin_pct)
+        with st.spinner("Building self-calibrated AIS coverage grid..."):
+            coverage_grid = build_coverage_grid(df, coverage_grid_size_deg)
+        with st.spinner("Detecting dark vessel gaps..."):
+            dark_gaps = detect_dark_gaps(df, dark_threshold_hours)
+            dark_gaps = classify_dark_gaps(
+                dark_gaps, coverage_grid, bounds, coverage_grid_size_deg,
+                well_covered_gap_hours, min_reports_per_cell,
+            )
+        st.session_state.dark_gaps = dark_gaps
+        st.session_state.region_bounds = bounds
+
     # --- Render from session_state (independent of the button value). ------
     if st.session_state.n_rows is not None:
         st.success(
@@ -644,6 +889,8 @@ if ais_file is not None:
         stops_far_from_port = st.session_state.stops_far_from_port
         ports = st.session_state.ports
         sts_pairs = st.session_state.sts_pairs
+        dark_gaps = st.session_state.dark_gaps
+        region_bounds = st.session_state.region_bounds
 
         st.success(
             f"Found {len(stops_at_port) + len(stops_far_from_port):,} stationary "
@@ -673,6 +920,18 @@ if ais_file is not None:
         picker_col1, picker_col2 = st.columns([2, 1])
         vessel_choice = picker_col1.selectbox("Filter map by vessel", ["All vessels"] + all_vessels)
         map_style = picker_col2.radio("Map style", ["Light", "Satellite"], horizontal=True)
+
+        dark_cat_col, bounds_col = st.columns([3, 1])
+        all_dark_categories = [
+            "Likely dark (AIS off)", "Likely coverage gap",
+            "Possibly left monitored area", "Insufficient coverage data",
+        ]
+        dark_categories_to_show = dark_cat_col.multiselect(
+            "Show on map: dark-vessel categories", all_dark_categories,
+            default=["Likely dark (AIS off)"],
+        )
+        show_region_bounds_toggle = bounds_col.checkbox("Show region bounds", value=False)
+
         if vessel_choice != "All vessels":
             map_near = stops_at_port[stops_at_port["vessel_id"] == vessel_choice]
             map_far = stops_far_from_port[stops_far_from_port["vessel_id"] == vessel_choice]
@@ -682,20 +941,30 @@ if ais_file is not None:
                 ]
             else:
                 map_sts = sts_pairs
+            if dark_gaps is not None and len(dark_gaps):
+                map_dark = dark_gaps[dark_gaps["vessel_id"] == vessel_choice]
+            else:
+                map_dark = dark_gaps
         else:
             map_near = stops_at_port
             map_far = stops_far_from_port
             map_sts = sts_pairs
+            map_dark = dark_gaps
 
         map_col, legend_col = st.columns([5, 1])
         with map_col:
-            cache_key = (vessel_choice, map_style)
+            cache_key = (
+                vessel_choice, map_style, tuple(sorted(dark_categories_to_show)), show_region_bounds_toggle,
+            )
             if cache_key not in st.session_state.map_cache:
                 st.session_state.map_cache[cache_key] = build_map(
                     ports, map_far, map_near,
                     fit_to_data=(vessel_choice != "All vessels"),
                     tile_style=map_style.lower(),
                     sts_pairs_df=map_sts,
+                    dark_df=map_dark,
+                    dark_categories_to_show=dark_categories_to_show,
+                    show_region_bounds=region_bounds if show_region_bounds_toggle else None,
                 )
             m = st.session_state.map_cache[cache_key]
             folium_static(m, width=1000, height=600)
@@ -771,6 +1040,62 @@ if ais_file is not None:
         else:
             st.info("No ship-to-ship transfer candidates found with the current thresholds.")
 
+        st.subheader("🌑 Dark vessel detection")
+        st.caption(
+            f"Vessels silent for at least {dark_threshold_hours}h, classified using a coverage grid "
+            "built from this dataset's own reporting density, plus a check for whether the vessel's "
+            "last known position was near the edge of the area this dataset covers."
+        )
+        if dark_gaps is not None and len(dark_gaps):
+            counts = dark_gaps["classification"].value_counts()
+            dcol1, dcol2, dcol3, dcol4 = st.columns(4)
+            dcol1.metric("Likely dark (AIS off)", int(counts.get("Likely dark (AIS off)", 0)))
+            dcol2.metric("Likely coverage gap", int(counts.get("Likely coverage gap", 0)))
+            dcol3.metric("Possibly left area", int(counts.get("Possibly left monitored area", 0)))
+            dcol4.metric("Insufficient data", int(counts.get("Insufficient coverage data", 0)))
+
+            filter_col, toggle_col2 = st.columns([3, 1])
+            category_filter = filter_col.multiselect(
+                "Filter table by classification", all_dark_categories, default=["Likely dark (AIS off)"],
+            )
+            show_full_ids_dark = toggle_col2.checkbox("Show full vessel IDs", value=False, key="dark_full_ids")
+
+            dark_display_df = dark_gaps[dark_gaps["classification"].isin(category_filter)] if category_filter else dark_gaps
+            display_cols_dark = [
+                "vessel_id", "classification", "last_seen_time", "reappear_time",
+                "gap_hours", "displacement_m", "cell_median_gap_hours", "cell_n_reports",
+            ]
+            dark_display = dark_display_df[display_cols_dark].round(
+                {"gap_hours": 1, "displacement_m": 0, "cell_median_gap_hours": 2}
+            )
+            if not show_full_ids_dark:
+                dark_display = dark_display.copy()
+                dark_display["vessel_id"] = dark_display["vessel_id"].apply(shorten_id)
+
+            st.dataframe(
+                dark_display,
+                use_container_width=True,
+                column_config={
+                    "vessel_id": st.column_config.TextColumn("Vessel", width="small"),
+                    "classification": st.column_config.TextColumn("Classification", width="medium"),
+                    "gap_hours": st.column_config.NumberColumn("Silence (h)", width="small"),
+                    "displacement_m": st.column_config.NumberColumn("Moved while dark (m)", width="small"),
+                    "cell_median_gap_hours": st.column_config.NumberColumn("Typical local gap (h)", width="small"),
+                    "cell_n_reports": st.column_config.NumberColumn("Reports in cell", width="small"),
+                },
+            )
+            if not show_full_ids_dark:
+                st.caption("Vessel IDs shortened for readability — tick \"Show full vessel IDs\" or use the CSV download for the complete values.")
+            st.download_button(
+                "Dark vessel events (CSV)",
+                dark_gaps.to_csv(index=False).encode("utf-8"),
+                "dark_vessel_events.csv",
+                "text/csv",
+                key="dl_dark",
+            )
+        else:
+            st.info("No dark-vessel gaps found with the current threshold.")
+
     elif has_plain_result:
         result = st.session_state.result
         if len(result) == 0:
@@ -785,6 +1110,24 @@ if ais_file is not None:
                 "stationary_episodes.csv",
                 "text/csv",
                 key="dl_plain",
+            )
+
+        dark_gaps = st.session_state.dark_gaps
+        if dark_gaps is not None and len(dark_gaps):
+            st.subheader("🌑 Dark vessel detection")
+            counts = dark_gaps["classification"].value_counts()
+            dcol1, dcol2, dcol3, dcol4 = st.columns(4)
+            dcol1.metric("Likely dark (AIS off)", int(counts.get("Likely dark (AIS off)", 0)))
+            dcol2.metric("Likely coverage gap", int(counts.get("Likely coverage gap", 0)))
+            dcol3.metric("Possibly left area", int(counts.get("Possibly left monitored area", 0)))
+            dcol4.metric("Insufficient data", int(counts.get("Insufficient coverage data", 0)))
+            st.dataframe(dark_gaps, use_container_width=True)
+            st.download_button(
+                "Dark vessel events (CSV)",
+                dark_gaps.to_csv(index=False).encode("utf-8"),
+                "dark_vessel_events.csv",
+                "text/csv",
+                key="dl_dark_plain",
             )
     elif not run:
         st.info("Set your parameters and click **Run analysis** in the sidebar.")
