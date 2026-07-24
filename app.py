@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import folium
-from folium.plugins import MarkerCluster
+from folium.plugins import MarkerCluster, HeatMap
 from streamlit_folium import folium_static
 from sklearn.neighbors import BallTree
 
@@ -481,6 +481,85 @@ def classify_dark_gaps(dark_df, coverage_grid, bounds, grid_size_deg, well_cover
     return dark_df.sort_values("gap_hours", ascending=False).reset_index(drop=True)
 
 
+# ============================================================
+# Coverage heatmap
+# ============================================================
+def build_coverage_heatmap_data(coverage_grid, grid_size_deg, metric="density"):
+    """Turn the coverage grid into [lat, lon, weight] points for folium's
+    HeatMap plugin, using the center of each cell.
+
+    metric="density"  -> weight = how many reports (from any vessel) fell in
+                          that cell; busier cells glow brighter.
+    metric="quality"   -> weight = inverse of the typical reporting gap in
+                          that cell; cells where reports arrive frequently
+                          (short typical gap) glow brighter, cells with long
+                          typical gaps (sparse coverage) stay dim.
+    """
+    grid = coverage_grid.dropna(subset=["n_reports"]).copy()
+    if grid.empty:
+        return []
+
+    grid["heat_lat"] = grid["cell_lat"] + grid_size_deg / 2
+    grid["heat_lon"] = grid["cell_lon"] + grid_size_deg / 2
+
+    if metric == "density":
+        weight = np.log1p(grid["n_reports"].astype(float))
+    else:
+        safe_gap = grid["median_gap_hours"].fillna(grid["median_gap_hours"].max()).clip(lower=0.01)
+        weight = 1.0 / safe_gap
+
+    max_weight = weight.max()
+    if max_weight > 0:
+        weight = weight / max_weight
+    grid["weight"] = weight
+
+    return grid[["heat_lat", "heat_lon", "weight"]].values.tolist()
+
+
+def build_coverage_heatmap_map(coverage_grid, grid_size_deg, metric="density", tile_style="light", region_bounds=None):
+    if coverage_grid is None or coverage_grid.empty:
+        center_lat, center_lon = 0.0, 0.0
+    else:
+        center_lat = coverage_grid["cell_lat"].mean() + grid_size_deg / 2
+        center_lon = coverage_grid["cell_lon"].mean() + grid_size_deg / 2
+
+    if tile_style == "satellite":
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=3, tiles=None)
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            attr="Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+            name="Satellite",
+        ).add_to(m)
+    else:
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=3, tiles="cartodbpositron")
+
+    heat_data = build_coverage_heatmap_data(coverage_grid, grid_size_deg, metric)
+    if heat_data:
+        HeatMap(heat_data, radius=18, blur=22, max_zoom=8, min_opacity=0.25).add_to(m)
+
+        lats = [pt[0] for pt in heat_data]
+        lons = [pt[1] for pt in heat_data]
+        m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]], padding=(20, 20))
+
+    if region_bounds:
+        b = region_bounds
+        folium.Rectangle(
+            bounds=[[b["lat_min"], b["lon_min"]], [b["lat_max"], b["lon_max"]]],
+            color="steelblue", weight=1.5, fill=False, dash_array="6,4",
+            tooltip="Dataset bounding box",
+        ).add_to(m)
+        folium.Rectangle(
+            bounds=[
+                [b["lat_min"] + b["lat_margin"], b["lon_min"] + b["lon_margin"]],
+                [b["lat_max"] - b["lat_margin"], b["lon_max"] - b["lon_margin"]],
+            ],
+            color="steelblue", weight=1, fill=False, dash_array="2,6", opacity=0.6,
+            tooltip="Edge margin - stops here may just have left the monitored area",
+        ).add_to(m)
+
+    return m
+
+
 def build_map(
     ports_df, stops_far_df, stops_near_df, fit_to_data=False, tile_style="light",
     sts_pairs_df=None, dark_df=None, dark_categories_to_show=None, show_region_bounds=None,
@@ -701,7 +780,8 @@ LEGEND_HTML = """
 for key, default in [
     ("result", None), ("stops_at_port", None), ("stops_far_from_port", None),
     ("ports", None), ("n_rows", None), ("n_vessels", None), ("map_cache", {}),
-    ("sts_pairs", None), ("dark_gaps", None), ("region_bounds", None),
+    ("sts_pairs", None), ("dark_gaps", None), ("region_bounds", None), ("coverage_grid", None),
+    ("coverage_grid_size_deg", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -873,6 +953,8 @@ if ais_file is not None:
             )
         st.session_state.dark_gaps = dark_gaps
         st.session_state.region_bounds = bounds
+        st.session_state.coverage_grid = coverage_grid
+        st.session_state.coverage_grid_size_deg = coverage_grid_size_deg
 
     # --- Render from session_state (independent of the button value). ------
     if st.session_state.n_rows is not None:
@@ -1096,6 +1178,39 @@ if ais_file is not None:
         else:
             st.info("No dark-vessel gaps found with the current threshold.")
 
+        st.subheader("🔥 AIS coverage heatmap")
+        st.caption(
+            "Built from this dataset's own reporting density (the same coverage grid used for "
+            "dark-vessel classification) - not an external source. Brighter = more/faster AIS "
+            "reports in that cell."
+        )
+        coverage_grid = st.session_state.coverage_grid
+        grid_size_for_heatmap = st.session_state.coverage_grid_size_deg
+        if coverage_grid is not None and len(coverage_grid):
+            heat_metric_col, heat_style_col, heat_bounds_col = st.columns([2, 1, 1])
+            heat_metric_label = heat_metric_col.radio(
+                "Metric", ["Report density", "Coverage quality (inverse typical gap)"], horizontal=True,
+            )
+            heat_metric = "density" if heat_metric_label == "Report density" else "quality"
+            heat_map_style = heat_style_col.radio("Map style", ["Light", "Satellite"], horizontal=True, key="heat_style")
+            heat_show_bounds = heat_bounds_col.checkbox("Show region bounds", value=False, key="heat_bounds")
+
+            heat_cache_key = ("heatmap", heat_metric, heat_map_style, heat_show_bounds)
+            if heat_cache_key not in st.session_state.map_cache:
+                st.session_state.map_cache[heat_cache_key] = build_coverage_heatmap_map(
+                    coverage_grid, grid_size_for_heatmap, metric=heat_metric,
+                    tile_style=heat_map_style.lower(),
+                    region_bounds=region_bounds if heat_show_bounds else None,
+                )
+            folium_static(st.session_state.map_cache[heat_cache_key], width=1000, height=550)
+            st.caption(
+                f"Grid cell size: {grid_size_for_heatmap}°. "
+                "\"Report density\" shows raw traffic volume; \"Coverage quality\" shows how "
+                "quickly reports typically arrive in each cell, regardless of traffic volume."
+            )
+        else:
+            st.info("No coverage grid available - run the analysis first.")
+
     elif has_plain_result:
         result = st.session_state.result
         if len(result) == 0:
@@ -1129,6 +1244,32 @@ if ais_file is not None:
                 "text/csv",
                 key="dl_dark_plain",
             )
+
+        coverage_grid = st.session_state.coverage_grid
+        grid_size_for_heatmap = st.session_state.coverage_grid_size_deg
+        if coverage_grid is not None and len(coverage_grid):
+            st.subheader("🔥 AIS coverage heatmap")
+            st.caption(
+                "Built from this dataset's own reporting density - not an external source. "
+                "Brighter = more/faster AIS reports in that cell."
+            )
+            heat_metric_col2, heat_style_col2 = st.columns([2, 1])
+            heat_metric_label2 = heat_metric_col2.radio(
+                "Metric", ["Report density", "Coverage quality (inverse typical gap)"],
+                horizontal=True, key="heat_metric_plain",
+            )
+            heat_metric2 = "density" if heat_metric_label2 == "Report density" else "quality"
+            heat_map_style2 = heat_style_col2.radio(
+                "Map style", ["Light", "Satellite"], horizontal=True, key="heat_style_plain",
+            )
+            heat_cache_key2 = ("heatmap_plain", heat_metric2, heat_map_style2)
+            if heat_cache_key2 not in st.session_state.map_cache:
+                st.session_state.map_cache[heat_cache_key2] = build_coverage_heatmap_map(
+                    coverage_grid, grid_size_for_heatmap, metric=heat_metric2,
+                    tile_style=heat_map_style2.lower(),
+                    region_bounds=st.session_state.region_bounds,
+                )
+            folium_static(st.session_state.map_cache[heat_cache_key2], width=1000, height=550)
     elif not run:
         st.info("Set your parameters and click **Run analysis** in the sidebar.")
 
